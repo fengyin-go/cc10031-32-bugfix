@@ -7,10 +7,12 @@
 - DirtyDataVault: 脏数据隔离区，存储校验不通过/解析失败的脏数据记录
 - FailureRecovery: 失败恢复管理器，记录失败步骤并支持重试
 - CollectRecord: 采集记录存储，记录每次采集产出的结构化数据
+- FlowVersionRegistry: 步骤归属索引 + 流程版本快照，保证同一步骤只属于一个流程
+- ProcessingLedger: 处理项台账，收敛业务清单/结果台账并同步跨业务面待办
 """
 from __future__ import annotations
 
-import json
+import copy
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -359,6 +361,477 @@ class FailureRecovery:
 
 
 # ---------------------------------------------------------------------------
+# 流程版本台账 (FlowVersionRegistry) — 步骤归属 + 版本快照 + 发布幂等
+# ---------------------------------------------------------------------------
+
+#: 流程版本编排的 32 号处理终态：归属冲突时版本快照落到该终态。
+CONFLICT_TERMINAL_CODE = 32
+TERMINAL_PUBLISHED = "已发布"
+TERMINAL_CONFLICT = "编排冲突"
+
+
+class FlowVersionRegistry:
+    """流程版本台账：持久化步骤归属索引和流程版本快照。
+
+    职责边界：
+    - 步骤归属唯一：一个步骤行只能被一个流程占用，认领是原子的；
+    - 版本快照：一次成功发布生成一条不可变快照，记录稳定步骤键；
+    - 发布幂等：同一发布键并发重复写入只接受一次，后续请求返回原结果；
+    - 冲突终态：归属冲突的发布不会写入第二个流程，而是记录 32 号冲突终态。
+
+    数据保存进程内存中（与 store 一致），页面刷新重新进入后读到的
+    仍是同一份快照和归属索引。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._seq = 0
+        self._step_owner: dict[int, int] = {}
+        self._snapshots: list[dict[str, Any]] = []
+        self._by_bot_version: dict[tuple[int, str], dict[str, Any]] = {}
+        self._by_publish_key: dict[str, dict[str, Any]] = {}
+        self._conflicts: list[dict[str, Any]] = []
+        self._claims: list[dict[str, Any]] = []
+
+    # ---- 步骤归属 ----
+
+    def owner_of(self, step_id: int) -> int | None:
+        with self._lock:
+            return self._step_owner.get(int(step_id))
+
+    def owner_map(self) -> dict[int, int]:
+        with self._lock:
+            return dict(self._step_owner)
+
+    def claim(self, step_id: int, bot_id: int) -> bool:
+        """原子认领：步骤已被其他流程占用时返回 False，绝不改挂。"""
+        with self._lock:
+            current = self._step_owner.get(int(step_id))
+            if current is not None and current != int(bot_id):
+                return False
+            self._step_owner[int(step_id)] = int(bot_id)
+            return True
+
+    def release(self, step_id: int) -> None:
+        with self._lock:
+            self._step_owner.pop(int(step_id), None)
+
+    def owned_step_ids(self, bot_id: int) -> list[int]:
+        with self._lock:
+            return sorted(
+                sid for sid, owner in self._step_owner.items() if owner == int(bot_id)
+            )
+
+    # ---- 版本快照 ----
+
+    def list_snapshots(self, bot_id: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._snapshots if bot_id is None else [
+                s for s in self._snapshots if s["bot_id"] == int(bot_id)
+            ]
+            return [copy.deepcopy(row) for row in rows]
+
+    def latest_snapshot(self, bot_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            for snapshot in reversed(self._snapshots):
+                if snapshot["bot_id"] == int(bot_id) and snapshot.get("terminal_state") == TERMINAL_PUBLISHED:
+                    return copy.deepcopy(snapshot)
+            return None
+
+    def snapshot_for_version(self, bot_id: int, version: str | None) -> dict[str, Any] | None:
+        """按流程 + 版本取快照；版本为空时取最新已发布快照。"""
+        if not version:
+            return self.latest_snapshot(bot_id)
+        with self._lock:
+            for snapshot in reversed(self._snapshots):
+                if (snapshot["bot_id"] == int(bot_id)
+                        and str(snapshot["version"]) == str(version)
+                        and snapshot.get("terminal_state") == TERMINAL_PUBLISHED):
+                    return copy.deepcopy(snapshot)
+            return None
+
+    def snapshot_by_id(self, snapshot_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            for snapshot in self._snapshots:
+                if snapshot["snapshot_id"] == int(snapshot_id):
+                    return copy.deepcopy(snapshot)
+            return None
+
+    def attach_message(self, snapshot_id: int, msg_id: int) -> None:
+        """把发布时产生的通道消息号回填到快照，便于重新进入后追溯。"""
+        with self._lock:
+            for snapshot in self._snapshots:
+                if snapshot["snapshot_id"] == int(snapshot_id):
+                    snapshot["msg_id"] = int(msg_id)
+                    self._by_publish_key[snapshot["publish_key"]]["msg_id"] = int(msg_id)
+                    return
+
+    def next_version(self, bot_id: int, current_version: str | None = None) -> str:
+        """生成流程的下一个版本号：首次发布沿用当前版本，之后递增 patch 位。"""
+        with self._lock:
+            latest = self.latest_snapshot(bot_id)
+        if latest is None:
+            raw = str(current_version or "").strip()
+            numbers = self._version_numbers(raw)
+            if numbers is None:
+                return "1.0.0"
+            return ".".join(str(n) for n in numbers)
+        numbers = self._version_numbers(str(latest.get("version")))
+        if numbers is None:
+            return "1.0.1"
+        numbers[2] += 1
+        return ".".join(str(n) for n in numbers)
+
+    @staticmethod
+    def _version_numbers(raw: str) -> list[int] | None:
+        parts = raw.split(".") if raw else []
+        if not parts or len(parts) > 3:
+            return None
+        try:
+            numbers = [int(p) for p in parts]
+        except ValueError:
+            return None
+        while len(numbers) < 3:
+            numbers.append(0)
+        return numbers
+
+    @classmethod
+    def normalize_version(cls, raw: Any) -> str:
+        """把外部给来的版本号收敛成 x.y.z；非法值回落到 1.0.0。"""
+        numbers = cls._version_numbers(str(raw or "").strip())
+        if numbers is None:
+            return "1.0.0"
+        return ".".join(str(n) for n in numbers)
+
+    @staticmethod
+    def make_publish_key(bot_id: int, base_version: str | None,
+                         step_keys: list[str],
+                         fingerprint: str | None = None) -> str:
+        """发布幂等键：同一流程的同一份步骤内容只生成一个版本。
+
+        给了 fingerprint 时按“流程 + 内容指纹”收敛，因此刷新页面后
+        再次发布同一份内容会返回原版本；内容改过才会生成新版本。
+        没给指纹时退化为“流程 + 基础版本 + 步骤键集合”，顺序无关。
+        """
+        if fingerprint:
+            return f"bot:{int(bot_id)}|fp:{fingerprint}"
+        joined = ",".join(sorted(str(key) for key in step_keys))
+        return f"bot:{int(bot_id)}|base:{base_version or '-'}|steps:{joined}"
+
+    def publish_version(
+        self,
+        *,
+        publish_key: str,
+        bot_id: int,
+        bot_name: str,
+        version: str,
+        base_version: str | None,
+        steps: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """原子登记一次流程版本发布，返回统一结果。
+
+        Args:
+            publish_key: 幂等键（流程 + 基础版本 + 步骤键集合）
+            bot_id / bot_name / version: 发布主体与目标版本
+            base_version: 发布前版本，用于识别并发写入
+            steps: 本次待归属的步骤行（需含稳定步骤键）
+
+        返回：
+            {"status": "created|replayed|conflict", "snapshot": ..., "message": ...}
+        """
+        with self._lock:
+            existing = self._by_publish_key.get(publish_key)
+            if existing is not None:
+                return {
+                    "status": "replayed",
+                    "snapshot": copy.deepcopy(existing),
+                    "message": "同一发布请求已受理，返回既有版本快照",
+                }
+
+            owner_bot = (int(bot_id), str(version))
+            if owner_bot in self._by_bot_version:
+                held = self._by_bot_version[owner_bot]
+                if held.get("publish_key") == publish_key:
+                    return {
+                        "status": "replayed",
+                        "snapshot": copy.deepcopy(held),
+                        "message": "同一版本与同一批步骤已受理，返回既有版本快照",
+                    }
+                record = {
+                    "bot_id": int(bot_id),
+                    "bot_name": bot_name,
+                    "version": version,
+                    "base_version": base_version,
+                    "conflict_step_ids": [],
+                    "terminal_state": TERMINAL_CONFLICT,
+                    "terminal_code": CONFLICT_TERMINAL_CODE,
+                    "message": f"版本 {version} 已被占用，并发写入只接受首个版本",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._conflicts.append(record)
+                return {
+                    "status": "conflict",
+                    "snapshot": copy.deepcopy(held),
+                    "conflict": copy.deepcopy(record),
+                    "message": record["message"],
+                }
+
+            claimed: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            conflicts: list[int] = []
+            # 先整批检查归属，任何一个步骤已归属别的流程就整批拒绝，
+            # 不做“部分写入”，避免同一版本里混入他人步骤。
+            for step in steps:
+                step_id = int(step["id"])
+                current = self._step_owner.get(step_id)
+                if current is not None and current != int(bot_id):
+                    skipped.append(step)
+                    conflicts.append(step_id)
+            if conflicts:
+                record = {
+                    "bot_id": int(bot_id),
+                    "bot_name": bot_name,
+                    "version": version,
+                    "base_version": base_version,
+                    "conflict_step_ids": conflicts,
+                    "skipped_step_ids": [int(s["id"]) for s in skipped],
+                    "terminal_state": TERMINAL_CONFLICT,
+                    "terminal_code": CONFLICT_TERMINAL_CODE,
+                    "message": "待发布步骤已归属其他流程，版本未写入",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._conflicts.append(record)
+                return {
+                    "status": "conflict",
+                    "snapshot": None,
+                    "skipped": [int(s["id"]) for s in skipped],
+                    "conflict": copy.deepcopy(record),
+                    "message": record["message"],
+                }
+
+            for step in steps:
+                step_id = int(step["id"])
+                self._step_owner[step_id] = int(bot_id)
+                claimed.append(step)
+
+            self._seq += 1
+            snapshot = {
+                "snapshot_id": self._seq,
+                "snapshot_no": self._seq,
+                "bot_id": int(bot_id),
+                "bot_name": bot_name,
+                "version": str(version),
+                "base_version": base_version,
+                "publish_key": publish_key,
+                "step_ids": [int(s["id"]) for s in claimed],
+                "step_keys": [s.get("step_key") or f"step-{s['id']}" for s in claimed],
+                "steps": [
+                    {
+                        "step_id": int(s["id"]),
+                        "step_key": s.get("step_key") or f"step-{s['id']}",
+                        "seq": s.get("步骤序号"),
+                        "name": s.get("步骤名称"),
+                        "type": s.get("操作类型"),
+                        "element": s.get("目标元素"),
+                        "status": s.get("status"),
+                    }
+                    for s in claimed
+                ],
+                "skipped_step_ids": [int(s["id"]) for s in skipped],
+                "conflict_step_ids": conflicts,
+                "terminal_state": TERMINAL_PUBLISHED if not conflicts else TERMINAL_CONFLICT,
+                "terminal_code": None if not conflicts else CONFLICT_TERMINAL_CODE,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._snapshots.append(snapshot)
+            self._by_bot_version[owner_bot] = snapshot
+            self._by_publish_key[publish_key] = snapshot
+            return {
+                "status": "created",
+                "snapshot": copy.deepcopy(snapshot),
+                "skipped": [int(s["id"]) for s in skipped],
+                "message": f"流程版本 {version} 已生成快照，归属步骤 {len(claimed)} 个",
+            }
+
+    def list_conflicts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return copy.deepcopy(self._conflicts)
+
+    def revise_step(self, step_id: int, bot_id: int, changes: dict[str, Any]) -> dict[str, Any] | None:
+        """修改某个流程已归属步骤的定义。
+
+        只允许归属流程本人修改；改完后旧版本快照保留原样，
+        新版本需重新发布后才会生成，满足“再次返回后持久保留原结果”。
+        """
+        with self._lock:
+            current = self._step_owner.get(int(step_id))
+            if current is None or current != int(bot_id):
+                return None
+            snapshot_owner = int(bot_id)
+        entry = store.find("step_editor", int(step_id))
+        if entry is None:
+            return None
+        for field, value in changes.items():
+            if field in ("id", "status", "pending", "abnormal"):
+                continue
+            entry[field] = value
+        entry["_revised_by"] = snapshot_owner
+        return entry
+
+    def add_claim(self, record: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self._claims.append(copy.deepcopy(record))
+            return copy.deepcopy(record)
+
+    def list_claims(self, bot_id: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._claims if bot_id is None else [
+                c for c in self._claims if c.get("bot_id") == int(bot_id)
+            ]
+            return copy.deepcopy(rows)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "snapshots": len(self._snapshots),
+                "owned_steps": len(self._step_owner),
+                "conflicts": len(self._conflicts),
+                "latest_snapshot_id": self._seq,
+            }
+
+
+# ---------------------------------------------------------------------------
+# 处理项台账 (ProcessingLedger) — 业务清单与结果台账一致、跨业务面待办
+# ---------------------------------------------------------------------------
+
+TODO_PENDING = "待处理"
+TODO_DONE = "已完成"
+
+
+class ProcessingLedger:
+    """处理项台账：一次“发布流程版本”就是一个处理项。
+
+    同一份结果同时出现在三个业务面：
+    - 业务清单（流程定义）：流程状态/版本号；
+    - 步骤编排：已归属步骤与版本快照；
+    - 任务队列：按稳定步骤键排出的执行项。
+    台账负责把三面写入收敛在一个事务里，并提供待办同步与一致性核对。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._items: dict[str, dict[str, Any]] = {}
+        self._todos: dict[str, list[dict[str, Any]]] = {}
+        self._seq = 0
+
+    def begin(self, item_key: str, *, bot_id: int, bot_name: str,
+              requested_version: str | None, base_version: str | None) -> dict[str, Any]:
+        """登记处理项（幂等）：同一键再次进入返回原结果，不产生第二个版本。"""
+        with self._lock:
+            existing = self._items.get(item_key)
+            if existing is not None:
+                return copy.deepcopy(existing)
+            self._seq += 1
+            item = {
+                "item_id": self._seq,
+                "item_key": item_key,
+                "bot_id": int(bot_id),
+                "bot_name": bot_name,
+                "requested_version": requested_version,
+                "base_version": base_version,
+                "state": "处理中",
+                "result": None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._items[item_key] = item
+            return copy.deepcopy(item)
+
+    def commit(self, item_key: str, result: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = self._items.get(item_key)
+            if item is None:
+                return {}
+            if item.get("result") is not None:
+                # 已固化结果：再次返回时原样返回，保留首次结果
+                return copy.deepcopy(item["result"])
+            item["result"] = copy.deepcopy(result)
+            item["state"] = "已处理" if result.get("published") else "处理失败"
+            item["finished_at"] = datetime.now(timezone.utc).isoformat()
+            return copy.deepcopy(item["result"])
+
+    def abort(self, item_key: str, message: str) -> None:
+        with self._lock:
+            item = self._items.get(item_key)
+            if item is not None and item.get("result") is None:
+                item["state"] = "处理失败"
+                item["error"] = message
+                item["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    def get(self, item_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            item = self._items.get(item_key)
+            return copy.deepcopy(item) if item else None
+
+    def list_items(self, bot_id: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [
+                copy.deepcopy(item) for item in self._items.values()
+                if bot_id is None or item["bot_id"] == int(bot_id)
+            ]
+        return sorted(rows, key=lambda r: r["item_id"])
+
+    # ---- 跨业务面待办 ----
+
+    def sync_todo(self, surface: str, ref_id: str, *, bot_id: int,
+                  title: str, state: str = TODO_PENDING,
+                  detail: dict[str, Any] | None = None) -> dict[str, Any]:
+        """写入/更新某个业务面的待办，同一 (surface, ref) 只有一条。"""
+        with self._lock:
+            bucket = self._todos.setdefault(surface, [])
+            for todo in bucket:
+                if todo["ref_id"] == ref_id:
+                    todo["state"] = state
+                    todo["title"] = title
+                    todo["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    if detail is not None:
+                        todo["detail"] = copy.deepcopy(detail)
+                    return copy.deepcopy(todo)
+            todo = {
+                "surface": surface,
+                "ref_id": ref_id,
+                "bot_id": int(bot_id),
+                "title": title,
+                "state": state,
+                "detail": copy.deepcopy(detail or {}),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            bucket.append(todo)
+            return copy.deepcopy(todo)
+
+    def todos(self, surface: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if surface:
+                return copy.deepcopy(self._todos.get(surface, []))
+            return [
+                copy.deepcopy(todo)
+                for bucket in self._todos.values() for todo in bucket
+            ]
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "items": len(self._items),
+                "processed": sum(1 for i in self._items.values() if i["state"] == "已处理"),
+                "failed": sum(1 for i in self._items.values() if i["state"] == "处理失败"),
+                "todos_pending": sum(
+                    1 for bucket in self._todos.values()
+                    for todo in bucket if todo["state"] == TODO_PENDING
+                ),
+            }
+
+
+# ---------------------------------------------------------------------------
 # 增强版 Store — 整合通道、脏数据、采集记录、恢复
 # ---------------------------------------------------------------------------
 
@@ -372,6 +845,10 @@ class Store:
         self.dirty_vault = DirtyDataVault()
         self.collect_records = CollectRecordStore()
         self.recovery = FailureRecovery()
+        # 流程版本台账：步骤归属索引 + 版本快照（跨页面/刷新持久）
+        self.flow_versions = FlowVersionRegistry()
+        # 处理项台账：发布结果 + 跨业务面待办
+        self.ledger = ProcessingLedger()
 
     # ---- 基础数据操作 ----
 

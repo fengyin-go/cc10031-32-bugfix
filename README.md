@@ -71,6 +71,20 @@ npm run dev
 | 运行概览 | `report_dashboard` | 运行数据 | 统计日期、总执行数、成功数 |
 | 任务队列 | `task_queue` | 排队任务 | 任务编号、流程名称、提交时间 |
 
+## 流程版本与步骤归属
+
+步骤只通过显式归属进入流程版本，未归属草稿不会被任何发布版本引用。
+
+- `app/services/step_ownership.py`：稳定步骤键、唯一归属、待认领队列
+- `app/store.py`：`FlowVersionRegistry`（归属索引 + 版本快照 + 发布幂等）、
+  `ProcessingLedger`（处理项台账与跨业务面待办）
+- 接口：`GET /api/flow-versions`、`POST /api/flow-versions/publish`、
+  `POST /api/flow-versions/claim`、`POST /api/flow-versions/release`、
+  `GET /api/flow-versions/integrity`、`GET /api/flow-versions/ledger`
+- 页面：`/flow-orchestration` 可查看已归属步骤、未归属草稿、待认领队列和版本快照
+
+归属冲突不会写入第二个流程，而是把发布记到 32 号处理终态（`编排冲突`）。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

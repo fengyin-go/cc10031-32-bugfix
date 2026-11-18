@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services import step_ownership
 from app.store import store
 
 
@@ -150,10 +151,10 @@ def pipeline_rpa_lifecycle(bot_id: int | None = None) -> PipelineResult:
     result.add_step("bot_definition", bot)
     result.data["bot"] = bot["流程名称"]
 
-    # 2) 步骤编排
-    steps = store.rows("step_editor")
+    # 2) 步骤编排：只消费显式归属该流程的步骤，未归属草稿不进入链路
+    steps = step_ownership.owned_steps(int(bot["id"]))
     if not steps:
-        result.add_error("未找到任何步骤编排")
+        result.add_error("该流程没有显式归属的步骤编排")
         result.ok = False
         return result
     for step in steps:
@@ -161,9 +162,16 @@ def pipeline_rpa_lifecycle(bot_id: int | None = None) -> PipelineResult:
         if step.get("status") not in ("已编排", "已验证"):
             vault.isolate(step, f"步骤状态异常: {step.get('status')}", "step_editor")
     result.data["steps"] = [s["步骤名称"] for s in steps]
+    result.data["step_keys"] = [s[step_ownership.KEY_FIELD] for s in steps]
     result.data["step_count"] = len(steps)
 
-    # 3) 执行记录
+    # 3) 版本快照：发布后的版本只引用已归属步骤
+    snapshot = store.flow_versions.latest_snapshot(int(bot["id"]))
+    result.data["version"] = snapshot["version"] if snapshot else None
+    result.data["snapshot_steps"] = len(snapshot["step_ids"]) if snapshot else 0
+    result.data["unassigned_steps"] = len(step_ownership.unowned_steps())
+
+    # 4) 执行记录
     execs = store.rows("execution_log")
     if not execs:
         result.add_error("无执行记录")
@@ -176,7 +184,7 @@ def pipeline_rpa_lifecycle(bot_id: int | None = None) -> PipelineResult:
     result.data["exec_ok"] = sum(1 for e in execs if e.get("status") == "执行成功")
     result.data["exec_fail"] = sum(1 for e in execs if e.get("status") == "执行失败")
 
-    # 4) 批次追踪
+    # 5) 批次追踪
     batches = store.rows("batch_tracker")
     if not batches:
         result.add_error("无批次追踪数据")
